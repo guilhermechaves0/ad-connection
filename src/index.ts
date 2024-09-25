@@ -1,110 +1,115 @@
 // Importar módulos
-import * as ldap from 'ldapjs';
-import { Request, Response } from 'express';
-import { ParamsDictionary } from 'express-serve-static-core';
-
-const express = require('express');
+require("dotenv").config();
+import * as ldap from "ldapjs";
+import express, { Request, Response } from "express"; // Corrigido importação do express
 
 const app = express();
-const port = 3000;
 
 // Definir o tipo de entry
 interface LdapEntry {
-    sAMAccountName: string;
-    objectName: string;
+  sAMAccountName: string;
+  objectName: string;
+  [key: string]: any; // Permitir armazenar outros atributos dinamicamente
 }
 
 // Função para decodificar strings com caracteres escapados para UTF-8
-function decodeUTF8String(escapedStr: string): string {
-    try {
-        return decodeURIComponent(escapedStr.replace(/\\+/g, '%'));
-    } catch (e) {
-        console.error('Error decoding string:', e);
-        return escapedStr; // Retorna a string original em caso de erro
+function safeDecodeURIComponent(escapedStr: string): string {
+  try {
+    // Verificar se a string é válida para ser decodificada
+    return decodeURIComponent(escapedStr);
+  } catch (e) {
+    if (e instanceof URIError) {
+      console.error("Error decoding string:", e.message);
+    } else {
+      console.error("Unknown error:", e);
     }
+    return escapedStr; // Retorna a string original em caso de erro
+  }
 }
 
 // Função auxiliar para fazer a conexão LDAP e buscar o sAMAccountName
-function searchSAMAccountName(sAMAccountName: string, callback: (err: Error | null, result: LdapEntry[] | null) => void) {
-    const client = ldap.createClient({
-        url: 'ldap://10.26.0.12:389'
-    });
+function searchSAMAccountName(
+  sAMAccountName: string,
+  callback: (err: Error | null, result: boolean) => void
+) {
+  const client = ldap.createClient({
+    url: `${process.env.LDAP_URL}`,
+  });
 
-    // Conectar-se ao servidor LDAP
-    client.bind('06826732505@EDUC.GOVRN', 'lighter', (err) => {
+  // Conectar-se ao servidor LDAP
+  client.bind(`${process.env.LOGIN}`, `${process.env.PASSWORD}`, (err) => {
+    if (err) {
+      console.error("Error in bind:", err);
+      callback(err, false);
+      return;
+    }
+
+    // Configuração da busca
+    const searchOptions: ldap.SearchOptions = {
+      filter: `(sAMAccountName=${sAMAccountName})`,
+      scope: "sub",
+      attributes: ["sAMAccountName"], // Busca apenas o sAMAccountName
+    };
+
+    // Realizar a busca no LDAP
+    client.search(
+      `${process.env.DC_PRIMARY},${process.env.DC_SECONDARY}`,
+      searchOptions,
+      (err, res) => {
         if (err) {
-            console.error('Error in bind:', err);
-            callback(err, null);
-            return;
+          console.error("Search error:", err);
+          callback(err, false);
+          return;
         }
 
-        // Configuração da busca
-        const searchOptions: ldap.SearchOptions = {
-            filter: `(sAMAccountName=${sAMAccountName})`,
-            scope: 'sub',
-            attributes: ['sAMAccountName']
-        };
+        let userFound = false;
 
-        // Realizar a busca no LDAP
-        client.search('dc=EDUC,dc=GOVRN', searchOptions, (err, res) => {
-            if (err) {
-                console.error('Search error:', err);
-                callback(err, null);
-                return;
-            }
-
-            let result: LdapEntry[] = [];
-
-            // Processar as entradas encontradas
-            res.on('searchEntry', (entry) => {
-                console.log('LDAP entry object:', entry.pojo);
-
-                // Decodificar objectName
-                const decodedObjectName = decodeUTF8String(entry.pojo.objectName); // Decodificar a string escapada
-
-                // Decodificar os valores escapados para UTF-8
-                const ldapEntryAttributes = entry.pojo.attributes.find(attr => attr.type === 'sAMAccountName');
-                if (ldapEntryAttributes && ldapEntryAttributes.values && ldapEntryAttributes.values[0]) {
-                    const decodedName = decodeUTF8String(ldapEntryAttributes.values[0]); // Decodificar o nome
-                    const ldapEntry: LdapEntry = { sAMAccountName: decodedName, objectName: decodedObjectName };
-                    console.log('LDAP entry found:', ldapEntry);
-                    result.push(ldapEntry);
-                } else {
-                    console.log('No valid entry found');
-                }
-            });
-
-            res.on('end', (resultCode: number) => {
-                client.unbind();
-                callback(null, result);
-            });
-
-            res.on('error', (err) => {
-                console.error('Search error:', err);
-                callback(err, null);
-            });
+        // Processar as entradas encontradas
+        res.on("searchEntry", (entry) => {
+          if (entry.attributes.some((attr) => attr.type === "sAMAccountName")) {
+            userFound = true; // Usuário encontrado
+          }
         });
-    });
+
+        res.on("end", () => {
+          client.unbind();
+          callback(null, userFound);
+        });
+
+        res.on("error", (err) => {
+          console.error("Search error:", err);
+          callback(err, false);
+        });
+      }
+    );
+  });
 }
 
 // Definir a rota que vai buscar o sAMAccountName
-app.get('/ldap/:sAMAccountName', (req: Request<{ sAMAccountName: string }>, res: Response) => {
+app.get(
+  "/ldap/:sAMAccountName",
+  (req: Request<{ sAMAccountName: string }>, res: Response) => {
     const sAMAccountName = req.params.sAMAccountName;
 
-    searchSAMAccountName(sAMAccountName, (err, result) => {
-        if (err) {
-            return res.status(500).json({ error: 'Error fetching LDAP data' });
-        }
+    searchSAMAccountName(sAMAccountName, (err, userFound) => {
+      if (err) {
+        return res.status(500).json({ error: "Error fetching LDAP data" });
+      }
 
-        if (result && result.length === 0) {
-            return res.status(404).json({ message: 'No entries found' });
-        }
-
-        res.json(result);
+      if (userFound) {
+        return res.json({ success: true, message: "User found in LDAP" }); // Corrigido "sucess" para "success"
+      } else {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found in LDAP" }); // Corrigido "sucess" para "success"
+      }
     });
-});
+  }
+);
 
 // Iniciar o servidor
-app.listen(port, () => {
-    console.log(`Server is running on http://localhost:${port}`);
+app.listen(process.env.PORT_ACESS, () => {
+  console.log(
+    `Server is running on ${process.env.HOST_ACESS}:${process.env.PORT_ACESS}`
+  );
 });
